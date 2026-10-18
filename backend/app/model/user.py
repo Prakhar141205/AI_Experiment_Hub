@@ -23,17 +23,16 @@ class User(SQLModel, table=True):
     )
 
     created_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(
-            DateTime,
-            nullable=False,
-            server_default=func.now(),
-        ),
-    )
+    default=None,
+    sa_column=Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+)
 
     last_login: datetime | None = Field(
-        default=None,
-        sa_column=Column(DateTime, nullable=True),
-    )
-
+    default=None,
+    sa_column=Column(DateTime(timezone=True), nullable=True),
+)
     account_status: bool = Field(default=True, nullable=False)
