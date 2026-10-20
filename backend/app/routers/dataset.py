@@ -18,7 +18,7 @@ from fastapi import (
     status,
 )
 from sqlmodel import Session, select
-
+from app.services.training_service import ALGORITHMS, train_model
 from app.core.dependencies import get_current_user
 from app.database.database import get_db
 from app.model.artifact import Artifact
@@ -32,6 +32,7 @@ from app.schemas.dataset import (
     DatasetRead,
     PredictionRequest,
     TrainingRequest,
+    ModelComparisonRequest,
 )
 from app.services.dataset_profiling_service import profile_dataset
 from app.services.dataset_service import upload_dataset
@@ -731,4 +732,277 @@ def get_prediction_history(
             }
             for item in predictions
         ],
+    }
+
+
+
+@router.post("/{dataset_id}/compare", status_code=status.HTTP_201_CREATED)
+def compare_dataset_models(
+    dataset_id: int,
+    request: ModelComparisonRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[Session, Depends(get_db)],
+) -> dict:
+    # 1. Validate dataset ownership and availability.
+    dataset = session.exec(
+        select(Dataset).where(
+            Dataset.dataset_id == dataset_id,
+            Dataset.user_id == current_user.user_id,
+        )
+    ).first()
+
+    if dataset is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset not found.",
+        )
+
+    file_path = Path(dataset.file_path)
+    if not file_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset file not found on the server.",
+        )
+
+    try:
+        df = pd.read_csv(file_path)
+    except (
+        OSError,
+        ValueError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+    ) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to read the dataset CSV.",
+        ) from exc
+
+    if df.empty or df.columns.duplicated().any():
+        raise HTTPException(
+            status_code=400,
+            detail="Dataset is empty or contains duplicate column names.",
+        )
+
+    if len(request.algorithms) != len(set(request.algorithms)):
+        raise HTTPException(
+            status_code=400,
+            detail="Algorithms must be unique.",
+        )
+
+    # 2. Validate task/algorithm compatibility before creating an experiment.
+    supported = ALGORITHMS.get(request.task_type, {})
+    unsupported = [
+        algorithm
+        for algorithm in request.algorithms
+        if algorithm not in supported
+    ]
+    if unsupported:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Some algorithms do not support this task type.",
+                "task_type": request.task_type,
+                "unsupported_algorithms": unsupported,
+                "available_algorithms": sorted(supported),
+            },
+        )
+
+    required_columns = set(request.feature_columns)
+    required_columns.add(request.target_column)
+    missing_columns = sorted(required_columns - set(df.columns))
+
+    if missing_columns:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Requested columns do not exist.",
+                "missing_columns": missing_columns,
+            },
+        )
+
+    if (
+        len(request.feature_columns) != len(set(request.feature_columns))
+        or request.target_column in request.feature_columns
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Features must be unique and must not include the target.",
+        )
+
+    # 3. Create one experiment to group all comparison runs.
+    experiment = Experiment(
+        user_id=current_user.user_id,
+        dataset_id=dataset_id,
+        name=f"{dataset.name} - Model Comparison",
+        description="Comparison of multiple algorithms on one dataset.",
+        task_type=request.task_type,
+        target_column=request.target_column,
+        status="running",
+        config={
+            "feature_columns": request.feature_columns,
+            "test_size": request.test_size,
+            "random_state": request.random_state,
+            "algorithms": request.algorithms,
+            "algorithm_hyperparameters": request.algorithm_hyperparameters,
+        },
+    )
+    session.add(experiment)
+    session.commit()
+    session.refresh(experiment)
+
+    results = []
+
+    # 4. Train and persist each algorithm independently.
+    for algorithm in request.algorithms:
+        params = request.algorithm_hyperparameters.get(algorithm, {})
+        started = time.perf_counter()
+        started_at = datetime.now(timezone.utc)
+
+        run = ModelRun(
+            experiment_id=experiment.experiment_id,
+            algorithm=algorithm,
+            status="running",
+            hyperparameters={
+                "test_size": request.test_size,
+                "random_state": request.random_state,
+                **params,
+            },
+            started_at=started_at,
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+
+        try:
+            training_result = train_model(
+                df=df,
+                feature_columns=request.feature_columns,
+                target_column=request.target_column,
+                task_type=request.task_type,
+                algorithm=algorithm,
+                test_size=request.test_size,
+                random_state=request.random_state,
+                hyperparameters=params,
+            )
+
+            model_info = save_model(
+                pipeline=training_result["pipeline"],
+                run_id=run.run_id,
+            )
+
+            run.status = "completed"
+            run.model_version = model_info.get("model_version", "1")
+            run.completed_at = datetime.now(timezone.utc)
+            run.duration_seconds = time.perf_counter() - started
+
+            session.add(
+                Artifact(
+                    experiment_id=experiment.experiment_id,
+                    run_id=run.run_id,
+                    name=model_info["name"],
+                    artifact_type="model",
+                    file_path=model_info["file_path"],
+                    mime_type=model_info.get(
+                        "mime_type", "application/octet-stream"
+                    ),
+                    file_size_bytes=model_info["file_size_bytes"],
+                    checksum_sha256=model_info["checksum_sha256"],
+                )
+            )
+
+            for metric_name, metric_value in training_result["metrics"].items():
+                if metric_value is not None:
+                    session.add(
+                        ExperimentMetric(
+                            run_id=run.run_id,
+                            metric_name=metric_name,
+                            metric_value=float(metric_value),
+                            dataset_split="test",
+                        )
+                    )
+
+            session.commit()
+            session.refresh(run)
+
+            artifact = session.exec(
+                select(Artifact).where(Artifact.run_id == run.run_id)
+            ).first()
+
+            results.append({
+                "run_id": run.run_id,
+                "algorithm": algorithm,
+                "status": "completed",
+                "metrics": training_result["metrics"],
+                "duration_seconds": run.duration_seconds,
+                "artifact_id": artifact.artifact_id if artifact else None,
+            })
+
+        except Exception as exc:
+            session.rollback()
+            logger.exception(
+                "Comparison training failed for algorithm=%s, dataset_id=%s",
+                algorithm,
+                dataset_id,
+            )
+
+            failed_run = session.get(ModelRun, run.run_id)
+            if failed_run is not None:
+                failed_run.status = "failed"
+                failed_run.error_message = str(exc)[:1000]
+                failed_run.completed_at = datetime.now(timezone.utc)
+                failed_run.duration_seconds = time.perf_counter() - started
+                session.add(failed_run)
+                session.commit()
+
+            results.append({
+                "run_id": run.run_id,
+                "algorithm": algorithm,
+                "status": "failed",
+                "metrics": {},
+                "duration_seconds": time.perf_counter() - started,
+                "error": str(exc)[:500],
+            })
+
+    # 5. Finalize the experiment and rank successful runs.
+    successful = [item for item in results if item["status"] == "completed"]
+    experiment.status = "completed" if successful else "failed"
+    experiment.updated_at = datetime.now(timezone.utc)
+    session.add(experiment)
+    session.commit()
+
+    ranking_metric = (
+        "f1_weighted" if request.task_type == "classification" else "r2"
+    )
+
+    successful.sort(
+        key=lambda item: (
+            item["metrics"].get(ranking_metric) is not None,
+            item["metrics"].get(ranking_metric) or 0,
+        ),
+        reverse=True,
+    )
+
+    for rank, item in enumerate(successful, start=1):
+        item["rank"] = rank
+
+    for item in results:
+        if item["status"] == "failed":
+            item["rank"] = None
+
+    return {
+        "message": "Model comparison finished.",
+        "experiment_id": experiment.experiment_id,
+        "dataset_id": dataset_id,
+        "task_type": request.task_type,
+        "ranking_metric": ranking_metric,
+        "successful_runs": len(successful),
+        "failed_runs": len(results) - len(successful),
+        "results": sorted(
+            results,
+            key=lambda item: (
+                item["rank"] is None,
+                item["rank"] or 999,
+            ),
+        ),
     }

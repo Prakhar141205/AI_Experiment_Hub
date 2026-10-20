@@ -35,3 +35,28 @@ class TrainingRequest(SQLModel):
 
 class PredictionRequest(SQLModel):
     input_data: dict[str, Any] = Field(min_length=1)
+
+
+
+class ModelComparisonRequest(SQLModel):
+    feature_columns: list[str] = Field(min_length=1)
+    target_column: str = Field(min_length=1, max_length=255)
+    task_type: Literal["classification", "regression"]
+    algorithms: list[
+        Literal[
+            "logistic_regression",
+            "svm",
+            "decision_tree",
+            "random_forest",
+            "knn",
+            "linear_regression",
+            "ridge",
+            "lasso",
+            "svr",
+        ]
+    ] = Field(min_length=2, max_length=6)
+    test_size: float = Field(default=0.2, gt=0, lt=1)
+    random_state: int = Field(default=42, ge=0)
+    algorithm_hyperparameters: dict[str, dict[str, Any]] = Field(
+        default_factory=dict
+    )
