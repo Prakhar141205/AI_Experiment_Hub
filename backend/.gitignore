@@ -110,3 +110,9 @@ data/processed/
 
 alembic/
 alembic.ini
+
+# =========================
+# Uploaded datasets and models
+# =========================
+uploads/datasets/
+uploads/models/
