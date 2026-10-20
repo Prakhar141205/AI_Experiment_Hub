@@ -1,12 +1,10 @@
 
 import pandas as pd
+import pytest
 
 from app.services.training_service import train_model
 
 
-# -----------------------------
-# Sample data for regression
-# -----------------------------
 df = pd.DataFrame({
     "hours_studied": [
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
@@ -28,10 +26,6 @@ df = pd.DataFrame({
     ],
 })
 
-
-# -----------------------------
-# Sample data for classification
-# -----------------------------
 classification_df = pd.DataFrame({
     "hours_studied": [
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
@@ -55,59 +49,91 @@ classification_df = pd.DataFrame({
     ],
 })
 
-
 FEATURE_COLUMNS = [
     "hours_studied",
     "attendance",
     "study_method",
 ]
 
+REGRESSION_ALGORITHMS = [
+    "linear_regression",
+    "ridge",
+    "lasso",
+    "svr",
+    "decision_tree",
+    "random_forest",
+]
 
-# -----------------------------
-# Regression test
-# -----------------------------
-def test_linear_regression():
+CLASSIFICATION_ALGORITHMS = [
+    "logistic_regression",
+    "svm",
+    "decision_tree",
+    "random_forest",
+    "knn",
+]
+
+
+@pytest.mark.parametrize("algorithm", REGRESSION_ALGORITHMS)
+def test_regression_algorithms(algorithm):
     result = train_model(
         df=df,
         feature_columns=FEATURE_COLUMNS,
         target_column="marks",
         task_type="regression",
-        algorithm="linear_regression",
+        algorithm=algorithm,
+        test_size=0.2,
+        random_state=42,
     )
 
     assert result["task_type"] == "regression"
-    assert result["algorithm"] == "linear_regression"
+    assert result["algorithm"] == algorithm
     assert result["train_rows"] > 0
     assert result["test_rows"] > 0
     assert result["train_rows"] + result["test_rows"] == len(df)
-
-    assert "mae" in result["metrics"]
-    assert "rmse" in result["metrics"]
-    assert "r2" in result["metrics"]
-
     assert result["pipeline"] is not None
 
+    for metric in ("mae", "mse", "rmse", "r2"):
+        assert metric in result["metrics"]
 
-# -----------------------------
-# Classification test
-# -----------------------------
-def test_logistic_regression():
+
+@pytest.mark.parametrize("algorithm", CLASSIFICATION_ALGORITHMS)
+def test_classification_algorithms(algorithm):
     result = train_model(
         df=classification_df,
         feature_columns=FEATURE_COLUMNS,
         target_column="result",
         task_type="classification",
-        algorithm="logistic_regression",
+        algorithm=algorithm,
+        test_size=0.2,
+        random_state=42,
     )
 
     assert result["task_type"] == "classification"
-    assert result["algorithm"] == "logistic_regression"
+    assert result["algorithm"] == algorithm
     assert result["train_rows"] > 0
     assert result["test_rows"] > 0
     assert (
         result["train_rows"] + result["test_rows"]
         == len(classification_df)
     )
-
-    assert "accuracy" in result["metrics"]
     assert result["pipeline"] is not None
+
+    for metric in ("accuracy", "precision_weighted",
+                   "recall_weighted", "f1_weighted"):
+        assert metric in result["metrics"]
+
+
+def test_random_state_and_hyperparameters_are_returned():
+    result = train_model(
+        df=df,
+        feature_columns=FEATURE_COLUMNS,
+        target_column="marks",
+        task_type="regression",
+        algorithm="random_forest",
+        random_state=17,
+        hyperparameters={"n_estimators": 20, "max_depth": 4},
+    )
+
+    assert result["random_state"] == 17
+    assert result["hyperparameters"]["n_estimators"] == 20
+    assert result["hyperparameters"]["max_depth"] == 4
